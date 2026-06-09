@@ -3,6 +3,7 @@
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
 #include "EmonLib.h"
+#include "time.h"
 
 #define WIFI_SSID ""
 #define WIFI_PASSWORD ""
@@ -56,7 +57,7 @@ void setup() {
   }
   Serial.println("[Sensor] Hardware estabilizado com sucesso!");
 
-  // Inicializa conexão Wi-Fi de forma correta (esperando conectar)
+  // Inicializa conexão Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Conectando ao Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -66,6 +67,7 @@ void setup() {
   Serial.println("\nWi-Fi Conectado com sucesso!");
   Serial.print("O modelo do chip é: ");
   Serial.println(chipName);
+  configTime(0, 0, "pool.ntp.org");
 
   config.api_key = API_KEY;
   auth.user.email = USER_EMAIL;
@@ -104,7 +106,6 @@ void loop() {
       } else {
         Serial.printf("Erro ao criar sensor: %s\n", fbdo.errorReason().c_str());
       }
-      Serial.println(fbdo.payload());
     }
 
     String collection = "aparelhos";
@@ -128,19 +129,17 @@ void loop() {
       if(jsonParser.get(document, "[0]/document/fields/powerLimit/doubleValue")){
         powerLimitValue = (int)document.floatValue;
         encontrado = true;
-        Serial.printf("Aparelho Ativo! Limite de Potência: %d W (double)\n", powerLimitValue);
       }
       else if(jsonParser.get(document, "[0]/document/fields/powerLimit/integerValue")){
         powerLimitValue = document.intValue;
         encontrado = true;
-        Serial.printf("Aparelho Ativo! Limite de Potência: %d W (int)\n", powerLimitValue);
       } 
     } else {
       Serial.printf("Erro HTTP na Query: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
     }
 
     if (!encontrado) {
-      Serial.println("Sistema em Standby: Aguardando seleção de aparelho no Firestore.");
+      Serial.println("Sistema em Standby: Aguardando seleção de aparelho para conectar.");
       
       digitalWrite(PINO_LED_VERDE, LOW);
       digitalWrite(PINO_LED_VERMELHO, LOW);
@@ -164,6 +163,20 @@ void loop() {
       return; 
     }
 
+    String idAparelho = "";
+    String statusAtual = "";
+    FirebaseJsonData docData;
+
+    if (jsonParser.get(docData, "[0]/document/name")) {
+      String fullName = docData.stringValue.c_str();
+      int ultimaBarra = fullName.lastIndexOf('/');
+      idAparelho = fullName.substring(ultimaBarra + 1);
+    }
+
+    if (jsonParser.get(docData, "[0]/document/fields/status/stringValue")) {
+      statusAtual = docData.stringValue.c_str();
+    }
+
     if (potenciaWatts >= powerLimitValue) {
       digitalWrite(PINO_LED_VERDE, LOW);       
       digitalWrite(PINO_LED_VERMELHO, HIGH);   
@@ -171,25 +184,44 @@ void loop() {
       
       Serial.printf("[ALERTA]: Potência de %.2f W acima do limite (%d W)!\n", potenciaWatts, powerLimitValue);
 
-      FirebaseJsonData docIdData;
-      if (jsonParser.get(docIdData, "[0]/document/name")) {
-        String fullName = docIdData.stringValue.c_str();
-        int ultimaBarra = fullName.lastIndexOf('/');
-        String idAparelho = fullName.substring(ultimaBarra + 1);
+      if (idAparelho != "") {
+        String subColecaoPath = "aparelhos/" + idAparelho + "/historico_picos";
+        String docId = "pico_" + String(millis());
 
-        String idPico = "pico_" + String(millis());
-        String caminhoSubcolecao = "aparelhos/" + idAparelho + "/historico_picos/" + idPico;
+        struct tm timeinfo;
+        String timestampStr = "1970-01-01T00:00:00Z";
+        
+        if (getLocalTime(&timeinfo)) {
+          char timeStringBuff[30];
+          strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+          timestampStr = String(timeStringBuff);
+        } else {
+          Serial.println("[Aviso] Falha ao capturar a hora do NTP, usando data padrão.");
+        }
 
         FirebaseJson picoPayload;
-        picoPayload.set("fields/correnteRegistrada/doubleValue", correnteAmpere);
-        picoPayload.set("fields/potenciaRegistrada/doubleValue", potenciaWatts);
+        picoPayload.set("fields/corrente/doubleValue", correnteAmpere);
+        picoPayload.set("fields/power/doubleValue", potenciaWatts);
+        picoPayload.set("fields/timestamp/timestampValue", timestampStr.c_str()); 
+        picoPayload.set("fields/type/stringValue", "Sobrecarga"); 
 
-        Serial.println("[Pico de Energia] Registrando pico de energia!");
+        Serial.println("[Pico de Energia] Registrando pico com dados completos...");
         
-        if (Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", caminhoSubcolecao.c_str(), picoPayload.raw(), "fields")) {
-          Serial.println("Sucesso! Evento de pico salvo.");
+        if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", subColecaoPath.c_str(), docId.c_str(), picoPayload.raw(), "")) {
+          Serial.println("Sucesso! Evento de pico salvo na subcoleção.");
         } else {
-          Serial.printf("Erro ao salvar: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
+          Serial.printf("Erro ao salvar pico: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
+        }
+
+        if (statusAtual != "falha") {
+          String caminhoAparelho = "aparelhos/" + idAparelho;
+          FirebaseJson updatePayload;
+          updatePayload.set("fields/status/stringValue", "falha"); 
+          
+          if (Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", caminhoAparelho.c_str(), updatePayload.raw(), "status")) {
+          } else {
+            Serial.printf("Erro ao atualizar status: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
+          }
         }
       }
     } else {
@@ -198,6 +230,17 @@ void loop() {
       noTone(PINO_BUZZER);
       
       Serial.printf("Monitoramento Normal: %.2f W / Limite: %d W\n", potenciaWatts, powerLimitValue);
+
+      if (idAparelho != "" && statusAtual != "online") {
+        String caminhoAparelho = "aparelhos/" + idAparelho;
+        FirebaseJson updatePayload;
+        updatePayload.set("fields/status/stringValue", "online"); 
+        
+        if (Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", caminhoAparelho.c_str(), updatePayload.raw(), "status")) {
+        } else {
+          Serial.printf("Erro ao atualizar status: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
+        }
+      }
     }
   }
 }
