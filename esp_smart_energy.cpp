@@ -12,6 +12,8 @@
 #define TENSAO_REDE 220.0     
 #define CALIBRACAO_SCT 20.0  
 
+#define TARIFA_KWH 0.95 
+
 #define PINO_LED_VERMELHO 26  
 #define PINO_LED_VERDE 27     
 #define PINO_BUZZER 14        
@@ -32,11 +34,13 @@ const long intervalo = 5000;
 String chipName = ESP.getChipModel();
 uint32_t freqCpu = ESP.getCpuFreqMHz();
 
+double horasPorDias = 0.0;
+double consumoAcumuladoWh = 0.0;
+
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // Configuração dos pinos dos LEDs e Buzzer como saídas digitais
   pinMode(PINO_LED_VERMELHO, OUTPUT);
   pinMode(PINO_LED_VERDE, OUTPUT);
   pinMode(PINO_BUZZER, OUTPUT);
@@ -47,7 +51,6 @@ void setup() {
 
   analogSetAttenuation(ADC_11db); 
 
-  // Inicialização e Calibração do Sensor SCT-013
   emon1.current(PINO_SCT, CALIBRACAO_SCT);
 
   Serial.println("\n[Sensor] Efetuando leituras de estabilização do hardware...");
@@ -57,7 +60,6 @@ void setup() {
   }
   Serial.println("[Sensor] Hardware estabilizado com sucesso!");
 
-  // Inicializa conexão Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Conectando ao Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -72,9 +74,7 @@ void setup() {
   config.api_key = API_KEY;
   auth.user.email = USER_EMAIL;
   auth.user.password = USER_PASSWORD;
-
   config.token_status_callback = tokenStatusCallback;
-
   config.signer.signupError.message.clear();
 
   Firebase.begin(&config, &auth);
@@ -83,7 +83,9 @@ void setup() {
   delay(1000);
 }
 
-void loop() {  
+void loop() {
+  unsigned long startTime = micros();
+
   static int powerLimitValue = 0;
   static String response = "";
   static FirebaseJson jsonParser;
@@ -115,8 +117,6 @@ void loop() {
     query.set("where/fieldFilter/field/fieldPath", "selected");
     query.set("where/fieldFilter/op", "EQUAL");
     query.set("where/fieldFilter/value/booleanValue", true);
-
-    Serial.println("\n[Firestore] Executando Query Parameter...");
     
     encontrado = false;
 
@@ -140,18 +140,16 @@ void loop() {
 
     if (!encontrado) {
       Serial.println("Sistema em Standby: Aguardando seleção de aparelho para conectar.");
-      
       digitalWrite(PINO_LED_VERDE, LOW);
       digitalWrite(PINO_LED_VERMELHO, LOW);
       noTone(PINO_BUZZER);
       return;
     }
 
-    // Leitura real por amostragem RMS.
     double maiorCorrente = emon1.calcIrms(1480);
 
     // Filtro de Ruído
-    if (maiorCorrente < 0.80) {
+    if (maiorCorrente < 1.80) { 
       maiorCorrente = 0.0;
     }
 
@@ -205,10 +203,10 @@ void loop() {
         picoPayload.set("fields/timestamp/timestampValue", timestampStr.c_str()); 
         picoPayload.set("fields/type/stringValue", "Sobrecarga"); 
 
-        Serial.println("[Pico de Energia] Registrando pico com dados completos...");
+        Serial.println("[Pico de Energia]");
         
         if (Firebase.Firestore.createDocument(&fbdo, FIREBASE_PROJECT_ID, "", subColecaoPath.c_str(), docId.c_str(), picoPayload.raw(), "")) {
-          Serial.println("Sucesso! Evento de pico salvo na subcoleção.");
+          Serial.println("Sucesso! Evento de pico salvo.");
         } else {
           Serial.printf("Erro ao salvar pico: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
         }
@@ -240,6 +238,34 @@ void loop() {
         } else {
           Serial.printf("Erro ao atualizar status: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
         }
+      }
+    }
+
+    unsigned long finishTime = micros();
+    unsigned long durationExecution = finishTime - startTime;
+    
+    double horasDesteCiclo = durationExecution / 3600000000.0;
+    horasPorDias = horasPorDias + horasDesteCiclo;
+    double consumoDesteCicloWh = potenciaWatts * horasDesteCiclo;
+    consumoAcumuladoWh = consumoAcumuladoWh + consumoDesteCicloWh;
+    double consumoTotalKWh = consumoAcumuladoWh / 1000.0;
+    double custoEstimadoRS = consumoTotalKWh * TARIFA_KWH;
+
+    Serial.printf("Tempo de uso acumulado: %.8f horas\n", horasPorDias);
+    Serial.printf("Consumo acumulado em tempo real: %.8f kWh\n", consumoTotalKWh);
+    Serial.printf("Custo financeiro estimado: R$ %.8f\n", custoEstimadoRS);
+    Serial.println("-----------------------------------");
+
+    if (idAparelho != "") {
+      String caminhoAparelho = "aparelhos/" + idAparelho;
+      FirebaseJson payloadAtualizacao;
+      
+      payloadAtualizacao.set("fields/horasPorDias/doubleValue", horasPorDias);
+      payloadAtualizacao.set("fields/totalConsumption/doubleValue", consumoTotalKWh);
+      payloadAtualizacao.set("fields/gastoEstimado/doubleValue", custoEstimadoRS);
+      
+      if (!Firebase.Firestore.patchDocument(&fbdo, FIREBASE_PROJECT_ID, "", caminhoAparelho.c_str(), payloadAtualizacao.raw(), "horasPorDias,totalConsumption,gastoEstimado")) {
+        Serial.printf("Erro ao atualizar dados de consumo: %d | Motivo: %s\n", fbdo.httpCode(), fbdo.errorReason().c_str());
       }
     }
   }
